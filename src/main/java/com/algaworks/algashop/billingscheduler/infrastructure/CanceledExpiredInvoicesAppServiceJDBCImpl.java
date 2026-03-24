@@ -22,13 +22,19 @@ public class CanceledExpiredInvoicesAppServiceJDBCImpl implements CanceledExpire
 
     private final JdbcOperations jdbcOperations;
     private final TransactionTemplate transactionTemplate;
+    private final FastpayPaymentAPIClient fastpayPaymentAPIClient;
 
     private static final Duration EXPIRED_SINCE = Duration.ofDays(1);
 
-    private static final int BATCH_LIMIT = 5;
+    private static final int BATCH_LIMIT = 50;
 
     private static final String SELECT_EXPIRED_INVOICES_SQL = String.format("""
-            select id from invoice i where i.expires_at <= now() - interval '%d days' and i.status = ?
+            select i.id, ps.gateway_code
+            from invoice i
+            inner join payment_settings ps on i.payment_settings_id = ps.id
+            where i.expires_at <= now() - interval '%d days'
+            and i.status = ?
+            order by i.expires_at asc
             limit ?
             for update
             skip locked
@@ -46,10 +52,10 @@ public class CanceledExpiredInvoicesAppServiceJDBCImpl implements CanceledExpire
     @Override
     public void cancelExpiredInvoices() {
         transactionTemplate.execute(status -> {
-            List<UUID> invoiceIds = fetchExpiredInvoices();
-            log.info("Task - Total invoices fetched: {}", invoiceIds.size());
-            int totalCanceledInvoices = cancelInvoices(invoiceIds);
-            if (invoiceIds.isEmpty()) {
+            List<InvoiceProjection> invoiceProjections = fetchExpiredInvoices();
+            log.info("Task - Total invoices fetched: {}", invoiceProjections.size());
+            int totalCanceledInvoices = cancelInvoices(invoiceProjections);
+            if (invoiceProjections.isEmpty()) {
                 log.info("Task - No expired invoices found for cancellation");
                 return true;
             }
@@ -58,26 +64,43 @@ public class CanceledExpiredInvoicesAppServiceJDBCImpl implements CanceledExpire
         });
     }
 
-    private List<UUID> fetchExpiredInvoices() {
+    private List<InvoiceProjection> fetchExpiredInvoices() {
         PreparedStatementSetter pss = ps -> {
             ps.setString(1, UNPAID_STATUS);
             ps.setInt(2, BATCH_LIMIT);
         };
-        RowMapper<UUID> mapper = (resultSet, rowNumber) -> resultSet.getObject("id", UUID.class);
+        RowMapper<InvoiceProjection> mapper = (resultSet, rowNumber) ->
+                new InvoiceProjection(resultSet.getObject("id", UUID.class),
+                        resultSet.getString("gateway_code"));
         return jdbcOperations.query(SELECT_EXPIRED_INVOICES_SQL, pss, mapper);
     }
 
-    private int cancelInvoices(List<UUID> invoiceIds) {
+    private int cancelInvoices(List<InvoiceProjection> invoiceProjections) {
+        List<InvoiceProjection> canceledInvoices = invoiceProjections.stream().filter(
+                invoiceProjection -> {
+                    try {
+                        fastpayPaymentAPIClient.cancel(invoiceProjection.getPaymentGatewayCode());
+                        log.info("Task - Invoice {} has the payment {} cancelled on gateway",
+                                invoiceProjection.getId(), invoiceProjection.getPaymentGatewayCode());
+                        return true;
+                    } catch (Exception e) {
+                        log.error("Task - Failed to cancel invoice {} payment {} on the gateway",
+                                invoiceProjection.getId(), invoiceProjection.getPaymentGatewayCode(), e);
+                        return false;
+                    }
+
+                }
+        ).toList();
         try {
-            jdbcOperations.batchUpdate(UPDATE_INVOICE_STATUS_SQL, invoiceIds, invoiceIds.size(),
-                    (ps, id) -> {
+            jdbcOperations.batchUpdate(UPDATE_INVOICE_STATUS_SQL, canceledInvoices, canceledInvoices.size(),
+                    (ps, invoiceProjection) -> {
                         ps.setString(1, CANCELED_STATUS);
                         ps.setString(2, CANCELED_REASON);
-                        ps.setObject(3, id);
+                        ps.setObject(3, invoiceProjection.getId());
                     });
 
-            log.info("Task - Invoice canceled IDS: {}", invoiceIds);
-            return invoiceIds.size();
+            log.info("Task - Invoice canceled");
+            return canceledInvoices.size();
         } catch (DataAccessException e) {
             log.error("Task failed to cancel invoices", e);
             return 0;
